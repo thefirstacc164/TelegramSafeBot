@@ -21,7 +21,8 @@ else:
     games_database = {}
 
 def get_main_menu_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    # Изменено избирательное скрытие: убираем селекторы для принудительного обновления интерфейса
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, row_width=2)
     btn_list = types.KeyboardButton("All Games")
     btn_search = types.KeyboardButton("Search")
     btn_lock = types.KeyboardButton("Lock")
@@ -34,7 +35,7 @@ def send_welcome(message):
     user_states[uid] = "LOCKED"
     bot.send_message(
         message.chat.id, 
-        "Password:", 
+        "🔒 Password:", 
         reply_markup=types.ReplyKeyboardRemove()
     )
 
@@ -43,22 +44,23 @@ def handle_text(message):
     uid = message.from_user.id
     text = message.text
 
-    # Если сейф заблокирован — проверяем пароль и СРАЗУ удаляем его
+    # Если сейф заблокирован — проверяем пароль и удаляем сообщение
     if user_states.get(uid, "LOCKED") == "LOCKED":
         try:
-            bot.delete_message(message.chat.id, message.message_id)  # Удаляем введенный пароль
+            bot.delete_message(message.chat.id, message.message_id)
         except Exception:
-            pass  # На случай если у бота нет прав (хотя в ЛС они всегда есть)
+            pass
 
         if text == VAULT_PASSWORD:
             user_states[uid] = "UNLOCKED"
+            # Принудительно шлем клавиатуру, чтобы она открылась внизу
             bot.send_message(
                 message.chat.id, 
-                "Open.", 
+                "🟢 Open.", 
                 reply_markup=get_main_menu_keyboard()
             )
         else:
-            bot.send_message(message.chat.id, "Incorrect.")
+            bot.send_message(message.chat.id, "🔴 Incorrect.")
         return
 
     # Если сейф открыт — обрабатываем команды меню
@@ -66,24 +68,24 @@ def handle_text(message):
         user_states[uid] = "LOCKED"
         bot.send_message(
             message.chat.id, 
-            "Password:", 
+            "🔒 Password:", 
             reply_markup=types.ReplyKeyboardRemove()
         )
         return
 
     elif text == "All Games":
         if not games_database:
-            bot.send_message(message.chat.id, "Empty.")
+            bot.send_message(message.chat.id, "Empty.", reply_markup=get_main_menu_keyboard())
             return
         
         markup = types.InlineKeyboardMarkup(row_width=1)
         for f_id, f_name in games_database.items():
-            markup.add(types.InlineKeyboardButton(text=f"🎮 {f_name}", callback_data=f_id))
-        bot.send_message(message.chat.id, "Games:", reply_markup=markup)
+            markup.add(types.InlineKeyboardButton(text=f"📦 {f_name}", callback_data=f_id))
+        bot.send_message(message.chat.id, "🎮 Games:", reply_markup=markup)
 
     elif text == "Search":
         user_states[uid] = "AWAITING_SEARCH"
-        bot.send_message(message.chat.id, "Enter name:")
+        bot.send_message(message.chat.id, "🔍 Enter name:")
 
     # Логика поиска (Ctrl+F)
     elif user_states.get(uid) == "AWAITING_SEARCH":
@@ -92,12 +94,12 @@ def handle_text(message):
         results = {f_id: f_name for f_id, f_name in games_database.items() if query in f_name.lower()}
         
         if not results:
-            bot.send_message(message.chat.id, "Not found.", reply_markup=get_main_menu_keyboard())
+            bot.send_message(message.chat.id, "❌ Not found.", reply_markup=get_main_menu_keyboard())
             return
             
         markup = types.InlineKeyboardMarkup(row_width=1)
         for f_id, f_name in results.items():
-            markup.add(types.InlineKeyboardButton(text=f"🎮 {f_name}", callback_data=f_id))
+            markup.add(types.InlineKeyboardButton(text=f"📦 {f_name}", callback_data=f_id))
             
         bot.send_message(message.chat.id, "Results:", reply_markup=markup)
 
@@ -121,7 +123,7 @@ def save_game_file(message):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(games_database, f, ensure_ascii=False, indent=4)
 
-    bot.send_message(message.chat.id, f"Saved: {file_name}")
+    bot.send_message(message.chat.id, f"Saved: {file_name}", reply_markup=get_main_menu_keyboard())
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_download(call):
