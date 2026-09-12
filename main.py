@@ -7,7 +7,7 @@ from threading import Thread
 
 # ================== НАСТРОЙКИ СЕЙФА ==================
 API_TOKEN = os.environ.get('API_TOKEN')  # Убедитесь, что вы перевыпустили его в BotFather!
-VAULT_PASSWORD = "qwer4321QWER$#@!qwer4321QWER$#@!"      # СЮДА НАПИШИТЕ ВАШ ПАРОЛЬ
+VAULT_PASSWORD = os.environ.get('VAULT_PASSWORD')      # СЮДА НАПИШИТЕ ВАШ ПАРОЛЬ
 # =====================================================
 
 bot = telebot.TeleBot(API_TOKEN)
