@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vault Bot — Discrete cloud storage via Telegram file_id linking.
-Features: Auto-harvesting, manual ID adding, persistent chat wiping, and 24h auto-delete.
+Features: Auto-harvesting, direct batch forwarding, chat wiping, and JSON backups.
 """
 
 import os
@@ -44,10 +44,8 @@ def _run_flask():
 
 bot = telebot.TeleBot(API_TOKEN, parse_mode=None)
 
-# State management
 user_states: dict[int, str] = {}
 last_activity: dict[int, float] = {}
-temp_add_data: dict[int, str] = {}  # Temporarily holds the filename while waiting for ID
 
 # ──────────────────────────── DATA MANAGERS ─────────────────────
 
@@ -75,7 +73,6 @@ def _add_record(name: str, file_id: str, file_type: str) -> bool:
     _save_json(DB_FILE, records)
     return True
 
-# Message Log Helpers
 def _log_msg(chat_id: int, message_id: int):
     logs = _load_json(MSG_LOG_FILE, {})
     cid = str(chat_id)
@@ -88,7 +85,6 @@ def _wipe_chat(chat_id: int) -> int:
     logs = _load_json(MSG_LOG_FILE, {})
     cid = str(chat_id)
     if cid not in logs: return 0
-    
     deleted = 0
     for mid in logs[cid]:
         try:
@@ -96,7 +92,6 @@ def _wipe_chat(chat_id: int) -> int:
             deleted += 1
         except Exception:
             pass 
-    
     logs[cid] = []
     _save_json(MSG_LOG_FILE, logs)
     return deleted
@@ -134,10 +129,7 @@ def _menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📂 All Games", callback_data="cb_all"),
         InlineKeyboardButton("🔍 Search", callback_data="cb_search"),
     )
-    mk.add(
-        InlineKeyboardButton("➕ Add ID", callback_data="cb_add"),
-        InlineKeyboardButton("🔒 Lock & Wipe", callback_data="cb_lock")
-    )
+    mk.add(InlineKeyboardButton("🔒 Lock & Wipe", callback_data="cb_lock"))
     return mk
 
 def _files_markup(records: list[dict]) -> InlineKeyboardMarkup:
@@ -169,9 +161,15 @@ def cmd_delete(msg):
     deleted = _wipe_chat(uid)
     _track_send(bot.send_message, uid, f"🧹 {deleted}")
 
-@bot.message_handler(commands=["chatid"])
-def cmd_chatid(msg):
-    bot.reply_to(msg, f"`{msg.chat.id}`", parse_mode="Markdown")
+@bot.message_handler(commands=["backup"], func=lambda m: _is_private(m))
+def cmd_backup(msg):
+    uid = msg.from_user.id
+    _log_msg(uid, msg.message_id)
+    if _state(uid) != "UNLOCKED": return
+    
+    if Path(DB_FILE).exists():
+        with open(DB_FILE, "rb") as f:
+            _track_send(bot.send_document, uid, f, caption="💾 DB Backup. Upload to restore.")
 
 # ──────────────────────────── CALLBACK QUERIES ──────────────────
 
@@ -202,12 +200,6 @@ def on_callback(call):
         bot.edit_message_text("🔍 Enter name:", cid, mid, reply_markup=_back_markup())
         bot.answer_callback_query(call.id)
         return
-    
-    if data == "cb_add":
-        _set_state(uid, "AWAITING_ADD_NAME")
-        bot.edit_message_text("📝 Enter name:", cid, mid, reply_markup=_back_markup())
-        bot.answer_callback_query(call.id)
-        return
 
     if data == "cb_lock":
         _set_state(uid, "LOCKED")
@@ -218,23 +210,24 @@ def on_callback(call):
 
     if data == "cb_back":
         _set_state(uid, "UNLOCKED")
-        temp_add_data.pop(uid, None) # Clear any pending add requests
         bot.edit_message_text("🟢 Open.", cid, mid, reply_markup=_menu_markup())
         bot.answer_callback_query(call.id)
         return
 
     if data.startswith("dl_"):
+        bot.answer_callback_query(call.id, "📥 Sending file...")
         try:
             idx = int(data[3:])
             rec = _load_db()[idx]
             file_id = rec["file_id"]
+            
+            # Send the actual file natively (.zip, .mp4, etc.)
             if rec.get("type") == "video":
                 _track_send(bot.send_video, cid, file_id)
             else:
                 _track_send(bot.send_document, cid, file_id)
-        except Exception:
-            _track_send(bot.send_message, cid, "❌ Not found.")
-        bot.answer_callback_query(call.id)
+        except Exception as e:
+            _track_send(bot.send_message, cid, f"❌ Failed. File may be unavailable.")
         return
 
     bot.answer_callback_query(call.id)
@@ -246,19 +239,21 @@ def on_callback(call):
     func=lambda m: m.chat.type in ("group", "supergroup") and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
 )
 def on_group_file(msg):
+    """Silently index files posted in the H group."""
     f = msg.document if msg.content_type == "document" else msg.video
     ftype = "document" if msg.content_type == "document" else "video"
     name = getattr(f, "file_name", None) or f"{ftype}_{f.file_id[:8]}"
     if _add_record(name, f.file_id, ftype):
-        log.info("Harvested: %s", name)
+        log.info("Harvested from group: %s", name)
 
-# ──────────────────────────── DM FILE UPLOADS ───────────────────
+# ──────────────────────────── DM FILE UPLOADS / FORWARDS ────────
 
 @bot.message_handler(
     content_types=["document", "video"],
     func=lambda m: _is_private(m) and _state(m.from_user.id) == "UNLOCKED"
 )
 def on_dm_file(msg):
+    """Handles direct file uploads and forwarded files in DM."""
     uid = msg.from_user.id
     _log_msg(uid, msg.message_id)
     _ping_activity(uid)
@@ -266,9 +261,25 @@ def on_dm_file(msg):
     f = msg.document if msg.content_type == "document" else msg.video
     ftype = "document" if msg.content_type == "document" else "video"
     name = getattr(f, "file_name", None) or f"{ftype}_{f.file_id[:8]}"
-    
-    _add_record(name, f.file_id, ftype)
-    _track_send(bot.send_message, uid, f"Saved: {name}", reply_markup=_menu_markup())
+
+    # Database Restore Logic (If user uploads a JSON backup)
+    if name == DB_FILE:
+        try:
+            file_info = bot.get_file(f.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            with open(DB_FILE, 'wb') as new_file:
+                new_file.write(downloaded_file)
+            _track_send(bot.send_message, uid, "✅ Database Restored!", reply_markup=_menu_markup())
+            return
+        except Exception as e:
+            _track_send(bot.send_message, uid, f"❌ Failed to restore DB: {e}")
+            return
+
+    # Normal save for .zip files and videos
+    if _add_record(name, f.file_id, ftype):
+        _track_send(bot.send_message, uid, f"✅ Saved: {name}")
+    else:
+        _track_send(bot.send_message, uid, f"⚠️ Duplicate skipped: {name}")
 
 # ──────────────────────────── DM TEXT HANDLER ───────────────────
 
@@ -308,24 +319,6 @@ def on_text(msg):
             _track_send(bot.send_message, cid, f"🎮 Games: {len(matches)}", reply_markup=mk)
         return
 
-    # ── AWAITING MANUAL FILE NAME ───────────────────────────────
-    if state == "AWAITING_ADD_NAME":
-        filename = (msg.text or "").strip()
-        temp_add_data[uid] = filename
-        _set_state(uid, "AWAITING_ADD_ID")
-        _track_send(bot.send_message, cid, "🆔 Enter ID:", reply_markup=_back_markup())
-        return
-
-    # ── AWAITING MANUAL FILE ID ─────────────────────────────────
-    if state == "AWAITING_ADD_ID":
-        file_id = (msg.text or "").strip()
-        filename = temp_add_data.pop(uid, "Unknown_File")
-        
-        _add_record(filename, file_id, "document")
-        _set_state(uid, "UNLOCKED")
-        _track_send(bot.send_message, cid, f"Saved: {filename}", reply_markup=_menu_markup())
-        return
-
 # ──────────────────────────── 24H AUTO-WIPE THREAD ──────────────
 
 def _auto_delete_worker():
@@ -333,13 +326,11 @@ def _auto_delete_worker():
         time.sleep(60)
         now = time.time()
         for uid, last_time in list(last_activity.items()):
-            if now - last_time > 86400: # 24 hours
+            if now - last_time > 86400:
                 if _state(uid) == "LOCKED":
-                    log.info("24H inactivity reached. Wiping chat %s", uid)
                     _wipe_chat(uid)
                     del last_activity[uid] 
                 else:
-                    log.info("24H reached but %s is UNLOCKED. Extending timer 1 hour.", uid)
                     last_activity[uid] += 3600
 
 # ──────────────────────────── ENTRY POINT ───────────────────────
@@ -355,7 +346,6 @@ def main():
     threading.Thread(target=_run_flask, daemon=True).start()
     threading.Thread(target=_auto_delete_worker, daemon=True).start()
     
-    log.info("Bot polling started.")
     bot.infinity_polling(timeout=60, long_polling_timeout=60, allowed_updates=[
         "message", "callback_query"
     ])
