@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vault Bot — discrete Telegram file_id vault.
-Persistent GitHub storage + aggressive chat wipe + native .zip sends.
+Features: GitHub storage + aggressive chat wipe + native .zip sends (no links) + auto-harvest.
 """
 
 import os
@@ -81,7 +81,6 @@ def _gh_headers():
     }
 
 def _gh_get_sha_and_content():
-    """Return (sha, content_dict) or (None, None)."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return None, None
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
@@ -98,7 +97,6 @@ def _gh_get_sha_and_content():
         return None, None
 
 def _gh_push(records: list):
-    """Create or update the DB file on GitHub."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
@@ -121,7 +119,6 @@ def _gh_push(records: list):
         log.warning("GitHub push failed: %s", e)
 
 def _pull_db_from_github():
-    """On startup: if GitHub has data, use it."""
     sha, content = _gh_get_sha_and_content()
     if content and isinstance(content, list):
         _save_json(DB_FILE, content)
@@ -136,7 +133,6 @@ def _load_db() -> list:
 
 def _save_db(records: list):
     _save_json(DB_FILE, records)
-    # Push to GitHub in background so replies stay fast
     threading.Thread(target=_gh_push, args=(records,), daemon=True).start()
 
 def _add_record(name: str, file_id: str, file_type: str) -> bool:
@@ -155,13 +151,11 @@ def _log_msg(chat_id: int, message_id: int):
     logs.setdefault(cid, [])
     if message_id not in logs[cid]:
         logs[cid].append(message_id)
-        # keep log from growing forever
         if len(logs[cid]) > 500:
             logs[cid] = logs[cid][-400:]
     _save_json(MSG_LOG_FILE, logs)
 
 def _track_send(method, chat_id, *args, **kwargs):
-    # Never generate link previews
     if method == bot.send_message:
         kwargs.setdefault("disable_web_page_preview", True)
     try:
@@ -174,15 +168,7 @@ def _track_send(method, chat_id, *args, **kwargs):
         return None
 
 def _aggressive_wipe(chat_id: int) -> int:
-    """
-    Delete everything possible:
-    1. All tracked IDs
-    2. Walk backward from the latest message ID until Telegram refuses
-       (48-hour limit / already gone / rate limit).
-    """
     deleted = 0
-
-    # 1) tracked messages
     logs = _load_json(MSG_LOG_FILE, {})
     cid = str(chat_id)
     tracked = list(logs.get(cid, []))
@@ -195,7 +181,6 @@ def _aggressive_wipe(chat_id: int) -> int:
     logs[cid] = []
     _save_json(MSG_LOG_FILE, logs)
 
-    # 2) probe current high-water mark
     try:
         probe = bot.send_message(chat_id, "·")
         max_id = probe.message_id
@@ -207,18 +192,17 @@ def _aggressive_wipe(chat_id: int) -> int:
     except Exception:
         return deleted
 
-    # 3) walk backwards (practical window ~300 msgs)
     consecutive_fail = 0
     for mid in range(max_id - 1, max(max_id - 350, 0), -1):
         try:
             bot.delete_message(chat_id, mid)
             deleted += 1
             consecutive_fail = 0
-            time.sleep(0.03)  # gentle on rate limits
+            time.sleep(0.03)
         except Exception:
             consecutive_fail += 1
             if consecutive_fail >= 20:
-                break  # older than 48h or empty history
+                break
     return deleted
 
 # ──────────────────────────── STATE ─────────────────────────────
@@ -274,7 +258,6 @@ def cmd_delete(msg):
     _log_msg(uid, msg.message_id)
     _ping(uid)
     n = _aggressive_wipe(uid)
-    # After wipe there is no history; send a fresh locked prompt
     _set_state(uid, "LOCKED")
     _track_send(bot.send_message, uid, f"🧹 {n}\n🔒 Password:")
 
@@ -341,11 +324,11 @@ def on_callback(call):
         try:
             idx = int(data[3:])
             rec = _load_db()[idx]
-            # Native file bubble — no caption, no links
+            # Native file bubble — caption="" forces Telegram to hide all text/links
             if rec.get("type") == "video":
-                _track_send(bot.send_video, cid, rec["file_id"])
+                _track_send(bot.send_video, cid, rec["file_id"], caption="")
             else:
-                _track_send(bot.send_document, cid, rec["file_id"])
+                _track_send(bot.send_document, cid, rec["file_id"], caption="")
         except Exception:
             _track_send(bot.send_message, cid, "❌")
         return
@@ -381,7 +364,6 @@ def on_dm_file(msg):
     ftype = "document" if msg.content_type == "document" else "video"
     name = getattr(f, "file_name", None) or f"{ftype}_{f.file_id[:8]}"
 
-    # Restore from backup JSON
     if name.endswith(".json") and "vault" in name.lower():
         try:
             info = bot.get_file(f.file_id)
@@ -399,7 +381,7 @@ def on_dm_file(msg):
     if _add_record(name, f.file_id, ftype):
         _track_send(bot.send_message, uid, f"✅ {name}")
     else:
-        _track_send(bot.send_message, uid, f"⚠️ {name}")
+        _track_send(bot.send_message, uid, f"⚠️ Duplicate skipped: {name}")
 
 # ──────────────────────────── DM TEXT ───────────────────────────
 
@@ -461,7 +443,6 @@ def main():
         log.error("API_TOKEN / VAULT_PASSWORD missing")
         raise SystemExit(1)
 
-    # Boot: prefer GitHub copy if it exists
     if not _pull_db_from_github():
         if not Path(DB_FILE).exists():
             _save_json(DB_FILE, [])
