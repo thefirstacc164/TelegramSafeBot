@@ -1,160 +1,332 @@
-import telebot
-from telebot import types
-import json
+#!/usr/bin/env python3
+"""
+Vault Bot — Discrete cloud storage via Telegram file_id linking.
+Single-file deployment target for Render.com.
+"""
+
 import os
+import json
+import threading
+import logging
+from pathlib import Path
 from flask import Flask
-from threading import Thread
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================== НАСТРОЙКИ СЕЙФА ==================
-API_TOKEN = os.environ.get('API_TOKEN')
-VAULT_PASSWORD = os.environ.get('VAULT_PASSWORD')
-# =====================================================
+# ──────────────────────────── CONFIG ────────────────────────────
 
-bot = telebot.TeleBot(API_TOKEN)
+API_TOKEN = os.environ.get("API_TOKEN", "")
+VAULT_PASSWORD = os.environ.get("VAULT_PASSWORD", "")
+PORT = int(os.environ.get("PORT", 8080))
 DB_FILE = "games_vault_db.json"
-user_states = {}
 
-if os.path.exists(DB_FILE):
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        games_database = json.load(f)
-else:
-    games_database = {}
+# ──────────────────────────── LOGGING ───────────────────────────
 
-def get_main_menu_keyboard():
-    # Изменено избирательное скрытие: убираем селекторы для принудительного обновления интерфейса
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, row_width=2)
-    btn_list = types.KeyboardButton("All Games")
-    btn_search = types.KeyboardButton("Search")
-    btn_lock = types.KeyboardButton("Lock")
-    markup.add(btn_list, btn_search, btn_lock)
-    return markup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("vault")
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    uid = message.from_user.id
-    user_states[uid] = "LOCKED"
-    bot.send_message(
-        message.chat.id, 
-        "🔒 Password:", 
-        reply_markup=types.ReplyKeyboardRemove()
+# ──────────────────────────── FLASK KEEP-ALIVE ──────────────────
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def health():
+    return "OK", 200
+
+
+@app.route("/health")
+def health_check():
+    return "OK", 200
+
+
+def _run_flask():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+
+# ──────────────────────────── BOT INIT ──────────────────────────
+
+bot = telebot.TeleBot(API_TOKEN, parse_mode=None)
+
+# Per-user states: "LOCKED" | "UNLOCKED" | "AWAITING_SEARCH"
+user_states: dict[int, str] = {}
+
+
+# ──────────────────────────── DB HELPERS ────────────────────────
+
+def _load_db() -> list[dict]:
+    """Return list of {name, file_id, type} dicts."""
+    path = Path(DB_FILE)
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_db(records: list[dict]) -> None:
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+
+def _add_record(name: str, file_id: str, file_type: str) -> None:
+    records = _load_db()
+    # Avoid exact duplicates by file_id
+    if any(r.get("file_id") == file_id for r in records):
+        return
+    records.append({"name": name, "file_id": file_id, "type": file_type})
+    _save_db(records)
+
+
+# ──────────────────────────── UI BUILDERS ───────────────────────
+
+def _menu_markup() -> InlineKeyboardMarkup:
+    mk = InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        InlineKeyboardButton("📂 All Games", callback_data="cb_all"),
+        InlineKeyboardButton("🔍 Search", callback_data="cb_search"),
     )
+    mk.add(InlineKeyboardButton("🔒 Lock", callback_data="cb_lock"))
+    return mk
 
-@bot.message_handler(func=lambda msg: True, content_types=['text'])
-def handle_text(message):
-    uid = message.from_user.id
-    text = message.text
 
-    # Если сейф заблокирован — проверяем пароль и удаляем сообщение
-    if user_states.get(uid, "LOCKED") == "LOCKED":
-        try:
-            bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
+def _files_markup(records: list[dict]) -> InlineKeyboardMarkup:
+    mk = InlineKeyboardMarkup(row_width=1)
+    for idx, rec in enumerate(records):
+        mk.add(
+            InlineKeyboardButton(
+                f"📦 {rec['name']}",
+                callback_data=f"dl_{idx}",
+            )
+        )
+    mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
+    return mk
 
-        if text == VAULT_PASSWORD:
-            user_states[uid] = "UNLOCKED"
-            # Принудительно шлем клавиатуру, чтобы она открылась внизу
-            bot.send_message(
-                message.chat.id, 
-                "🟢 Open.", 
-                reply_markup=get_main_menu_keyboard()
+
+def _back_markup() -> InlineKeyboardMarkup:
+    mk = InlineKeyboardMarkup()
+    mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
+    return mk
+
+
+# ──────────────────────────── STATE HELPERS ─────────────────────
+
+def _state(uid: int) -> str:
+    return user_states.get(uid, "LOCKED")
+
+
+def _set_state(uid: int, state: str) -> None:
+    user_states[uid] = state
+
+
+# ──────────────────────────── /start ────────────────────────────
+
+@bot.message_handler(commands=["start"])
+def cmd_start(msg):
+    uid = msg.from_user.id
+    _set_state(uid, "LOCKED")
+    bot.send_message(msg.chat.id, "🔒 Password:")
+
+
+# ──────────────────────────── CALLBACK QUERIES ──────────────────
+
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(call):
+    uid = call.from_user.id
+    cid = call.message.chat.id
+    mid = call.message.message_id
+    data = call.data
+
+    if _state(uid) == "LOCKED":
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── All Games ───────────────────────────────────────────────
+    if data == "cb_all":
+        records = _load_db()
+        if not records:
+            bot.edit_message_text(
+                "❌ Not found.",
+                chat_id=cid,
+                message_id=mid,
+                reply_markup=_back_markup(),
             )
         else:
-            bot.send_message(message.chat.id, "🔴 Incorrect.")
+            bot.edit_message_text(
+                "🎮 Games:",
+                chat_id=cid,
+                message_id=mid,
+                reply_markup=_files_markup(records),
+            )
+        bot.answer_callback_query(call.id)
         return
 
-    # Если сейф открыт — обрабатываем команды меню
-    if text == "Lock":
-        user_states[uid] = "LOCKED"
-        bot.send_message(
-            message.chat.id, 
-            "🔒 Password:", 
-            reply_markup=types.ReplyKeyboardRemove()
+    # ── Search ──────────────────────────────────────────────────
+    if data == "cb_search":
+        _set_state(uid, "AWAITING_SEARCH")
+        bot.edit_message_text(
+            "🔍 Enter name:",
+            chat_id=cid,
+            message_id=mid,
+            reply_markup=_back_markup(),
         )
+        bot.answer_callback_query(call.id)
         return
 
-    elif text == "All Games":
-        if not games_database:
-            bot.send_message(message.chat.id, "Empty.", reply_markup=get_main_menu_keyboard())
-            return
-        
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        for f_id, f_name in games_database.items():
-            markup.add(types.InlineKeyboardButton(text=f"📦 {f_name}", callback_data=f_id))
-        bot.send_message(message.chat.id, "🎮 Games:", reply_markup=markup)
-
-    elif text == "Search":
-        user_states[uid] = "AWAITING_SEARCH"
-        bot.send_message(message.chat.id, "🔍 Enter name:")
-
-    # Логика поиска (Ctrl+F)
-    elif user_states.get(uid) == "AWAITING_SEARCH":
-        user_states[uid] = "UNLOCKED"
-        query = text.lower()
-        results = {f_id: f_name for f_id, f_name in games_database.items() if query in f_name.lower()}
-        
-        if not results:
-            bot.send_message(message.chat.id, "❌ Not found.", reply_markup=get_main_menu_keyboard())
-            return
-            
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        for f_id, f_name in results.items():
-            markup.add(types.InlineKeyboardButton(text=f"📦 {f_name}", callback_data=f_id))
-            
-        bot.send_message(message.chat.id, "Results:", reply_markup=markup)
-
-# Сохранение игр (работает только в разблокированном состоянии)
-@bot.message_handler(content_types=['document', 'video'])
-def save_game_file(message):
-    uid = message.from_user.id
-    if user_states.get(uid, "LOCKED") != "UNLOCKED":
+    # ── Lock ────────────────────────────────────────────────────
+    if data == "cb_lock":
+        _set_state(uid, "LOCKED")
+        bot.edit_message_text("🔒 Password:", chat_id=cid, message_id=mid)
+        bot.answer_callback_query(call.id)
         return
 
-    if message.document:
-        file_id = message.document.file_id
-        file_name = message.document.file_name or "Untitled"
-    elif message.video:
-        file_id = message.video.file_id
-        file_name = message.video.file_name or "Video"
-    else:
+    # ── Back to menu ────────────────────────────────────────────
+    if data == "cb_back":
+        _set_state(uid, "UNLOCKED")
+        bot.edit_message_text(
+            "🟢 Open.",
+            chat_id=cid,
+            message_id=mid,
+            reply_markup=_menu_markup(),
+        )
+        bot.answer_callback_query(call.id)
         return
 
-    games_database[file_id] = file_name
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(games_database, f, ensure_ascii=False, indent=4)
-
-    bot.send_message(message.chat.id, f"Saved: {file_name}", reply_markup=get_main_menu_keyboard())
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_download(call):
-    uid = call.from_user.id
-    if user_states.get(uid, "LOCKED") != "UNLOCKED":
-        bot.answer_callback_query(call.id, "Locked.", show_alert=True)
-        return
-
-    file_id = call.data
-    if file_id in games_database:
+    # ── Download file by index ──────────────────────────────────
+    if data.startswith("dl_"):
         try:
-            bot.answer_callback_query(call.id, "Sending...")
-            bot.send_document(call.message.chat.id, file_id)
-        except Exception as e:
-            bot.answer_callback_query(call.id, "Error.", show_alert=True)
+            idx = int(data[3:])
+            records = _load_db()
+            rec = records[idx]
+            file_id = rec["file_id"]
+            file_type = rec.get("type", "document")
 
-# === ФОНОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER.COM ===
-app = Flask('')
+            if file_type == "video":
+                bot.send_video(cid, file_id)
+            else:
+                bot.send_document(cid, file_id)
+        except (IndexError, ValueError, KeyError) as exc:
+            log.warning("Download callback error: %s", exc)
+            bot.send_message(cid, "❌ Not found.")
+        bot.answer_callback_query(call.id)
+        return
 
-@app.route('/')
-def home():
-    return "Status: OK"
+    bot.answer_callback_query(call.id)
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
 
-def keep_alive():
-    t = Thread(target=run_web_server)
-    t.start()
+# ──────────────────────────── FILE UPLOADS ──────────────────────
+
+@bot.message_handler(
+    content_types=["document"],
+    func=lambda m: _state(m.from_user.id) == "UNLOCKED",
+)
+def on_document(msg):
+    doc = msg.document
+    name = doc.file_name or f"file_{doc.file_id[:8]}"
+    _add_record(name, doc.file_id, "document")
+    bot.reply_to(msg, f"Saved: {name}", reply_markup=_menu_markup())
+
+
+@bot.message_handler(
+    content_types=["video"],
+    func=lambda m: _state(m.from_user.id) == "UNLOCKED",
+)
+def on_video(msg):
+    vid = msg.video
+    name = vid.file_name or f"video_{vid.file_id[:8]}"
+    _add_record(name, vid.file_id, "video")
+    bot.reply_to(msg, f"Saved: {name}", reply_markup=_menu_markup())
+
+
+# ──────────────────────────── TEXT HANDLER ──────────────────────
+
+@bot.message_handler(
+    content_types=["text"],
+    func=lambda m: True,
+)
+def on_text(msg):
+    uid = msg.from_user.id
+    cid = msg.chat.id
+    state = _state(uid)
+
+    # ── LOCKED — password attempt ───────────────────────────────
+    if state == "LOCKED":
+        # Immediately remove the password message from chat
+        try:
+            bot.delete_message(cid, msg.message_id)
+        except Exception:
+            pass  # May lack permission in groups; silently continue
+
+        if msg.text and msg.text.strip() == VAULT_PASSWORD:
+            _set_state(uid, "UNLOCKED")
+            bot.send_message(cid, "🟢 Open.", reply_markup=_menu_markup())
+        else:
+            bot.send_message(cid, "🔴 Incorrect.")
+        return
+
+    # ── AWAITING_SEARCH — keyword lookup ────────────────────────
+    if state == "AWAITING_SEARCH":
+        query = (msg.text or "").strip().lower()
+        records = _load_db()
+        matches = [
+            r for r in records if query in r.get("name", "").lower()
+        ]
+        _set_state(uid, "UNLOCKED")
+
+        if not matches:
+            bot.send_message(
+                cid, "❌ Not found.", reply_markup=_menu_markup()
+            )
+        else:
+            # Build markup with original indices so download works
+            mk = InlineKeyboardMarkup(row_width=1)
+            for rec in matches:
+                original_idx = records.index(rec)
+                mk.add(
+                    InlineKeyboardButton(
+                        f"📦 {rec['name']}",
+                        callback_data=f"dl_{original_idx}",
+                    )
+                )
+            mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
+            bot.send_message(cid, "🎮 Games:", reply_markup=mk)
+        return
+
+    # ── UNLOCKED but random text — silently ignore ──────────────
+
+
+# ──────────────────────────── ENTRY POINT ───────────────────────
+
+def main():
+    # Validate critical env vars
+    if not API_TOKEN:
+        log.error("API_TOKEN environment variable is missing.")
+        raise SystemExit(1)
+    if not VAULT_PASSWORD:
+        log.error("VAULT_PASSWORD environment variable is missing.")
+        raise SystemExit(1)
+
+    # Ensure DB file exists
+    if not Path(DB_FILE).exists():
+        _save_db([])
+
+    # Start Flask in a daemon thread so Render sees an open port
+    flask_thread = threading.Thread(target=_run_flask, daemon=True)
+    flask_thread.start()
+    log.info("Flask keep-alive started on port %s", PORT)
+
+    # Start long-polling (auto-reconnect on failure)
+    log.info("Bot polling started.")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
 
 if __name__ == "__main__":
-    keep_alive()
-    bot.infinity_polling()
+    main()
