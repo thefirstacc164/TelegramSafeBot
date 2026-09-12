@@ -6,8 +6,8 @@ from flask import Flask
 from threading import Thread
 
 # ================== НАСТРОЙКИ СЕЙФА ==================
-API_TOKEN = 'ВСТАВЬТЕ_СЮДА_ВАШ_НОВЫЙ_TOKEN'  # Убедитесь, что вы перевыпустили его в BotFather!
-VAULT_PASSWORD = "my_secret_password_123"      # СЮДА НАПИШИТЕ ВАШ ПАРОЛЬ
+API_TOKEN = os.environ.get('API_TOKEN')  # Убедитесь, что вы перевыпустили его в BotFather!
+VAULT_PASSWORD = "qwer4321QWER$#@!qwer4321QWER$#@!"      # СЮДА НАПИШИТЕ ВАШ ПАРОЛЬ
 # =====================================================
 
 bot = telebot.TeleBot(API_TOKEN)
