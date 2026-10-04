@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vault Bot — discrete Telegram file_id vault.
-Features: GitHub storage, chat wipe, auto-categories, and H-group upload routing.
+Features: GitHub storage, Smart Naming (/name), Auto-sequencing, Categories, and H-group routing.
 """
 
 import os
@@ -128,11 +128,48 @@ def _add_record(name: str, file_id: str, file_type: str) -> bool:
     _save_db(records)
     return True
 
-def _get_ext(name: str) -> str:
-    """Extracts file extension (e.g., '.zip'). Defaults to 'other'."""
-    if "." in name:
+# ──────────────────────────── SMART NAMING ──────────────────────
+
+def _get_ext(name: str, ftype: str) -> str:
+    """Extracts or guesses file extension safely."""
+    if "." in name and len(name.rsplit(".", 1)[-1]) <= 4:
         return "." + name.rsplit(".", 1)[-1].lower()
-    return "other"
+    if ftype == "video": return ".mp4"
+    if ftype == "audio": return ".mp3"
+    if ftype == "document": return ".zip"
+    return ".bin"
+
+def _determine_filename(msg, file_obj, ftype: str) -> str:
+    """Smart engine to find the best possible filename."""
+    name = ""
+    
+    # 1. Check Caption for `/name` or pure text
+    if msg.caption:
+        cap = msg.caption.strip()
+        if cap.lower().startswith("/name "):
+            name = cap[6:].strip()
+        else:
+            name = cap
+            
+    # 2. Check original filename
+    if not name:
+        name = getattr(file_obj, "file_name", None)
+        
+    # 3. Auto-Sequencer (e.g., Video_1)
+    if not name:
+        records = _load_db()
+        count = sum(1 for r in records if r.get("type") == ftype)
+        name = f"{ftype.capitalize()}_{count + 1}"
+        
+    # Clean up multiline captions to just the first line
+    name = name.split("\n")[0][:60].strip()
+    
+    # Ensure it has an extension
+    ext = _get_ext(name, ftype)
+    if not name.lower().endswith(ext):
+        name += ext
+        
+    return name
 
 # ──────────────────────────── MESSAGE LOG + WIPE ────────────────
 
@@ -151,7 +188,7 @@ def _track_send(method, chat_id, *args, **kwargs):
         m = method(chat_id, *args, **kwargs)
         if m and hasattr(m, "message_id"): _log_msg(chat_id, m.message_id)
         return m
-    except Exception as e: return None
+    except Exception: return None
 
 def _aggressive_wipe(chat_id: int) -> int:
     deleted = 0
@@ -204,7 +241,6 @@ def _menu_markup():
     return mk
 
 def _files_markup(records_with_indices: list):
-    """Expects a list of tuples: (original_idx, record)"""
     mk = InlineKeyboardMarkup(row_width=1)
     for idx, rec in records_with_indices:
         mk.add(InlineKeyboardButton(f"📦 {rec['name']}", callback_data=f"dl_{idx}"))
@@ -212,17 +248,12 @@ def _files_markup(records_with_indices: list):
     return mk
 
 def _categories_markup(records: list):
-    # Count extensions
-    exts = [_get_ext(r.get("name", "")) for r in records]
+    exts = [_get_ext(r.get("name", ""), r.get("type", "")) for r in records]
     counts = Counter(exts)
-    
     mk = InlineKeyboardMarkup(row_width=2)
-    # Sort by popularity (most common first)
     for ext, count in counts.most_common():
-        # Encode extension into callback data safely
         safe_ext = ext.replace(".", "")
         mk.add(InlineKeyboardButton(f"🗂 {ext.upper()} ({count})", callback_data=f"cat_{safe_ext}"))
-    
     mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
     return mk
 
@@ -248,14 +279,6 @@ def cmd_delete(msg):
     n = _aggressive_wipe(uid)
     _set_state(uid, "LOCKED")
     _track_send(bot.send_message, uid, f"🧹 {n}\n🔒 Password:")
-
-@bot.message_handler(commands=["backup"], func=lambda m: _is_private(m))
-def cmd_backup(msg):
-    uid = msg.from_user.id
-    if _state(uid) != "UNLOCKED": return
-    _log_msg(uid, msg.message_id)
-    if Path(DB_FILE).exists():
-        with open(DB_FILE, "rb") as f: _track_send(bot.send_document, uid, f, caption="💾")
 
 @bot.message_handler(commands=["chatid"])
 def cmd_chatid(msg):
@@ -297,8 +320,7 @@ def on_callback(call):
     if data.startswith("cat_"):
         ext_target = data.split("_", 1)[1]
         records = _load_db()
-        # Find all files where the extension (without dot) matches the target
-        subset = [(i, r) for i, r in enumerate(records) if _get_ext(r.get("name","")).replace(".", "") == ext_target]
+        subset = [(i, r) for i, r in enumerate(records) if _get_ext(r.get("name",""), r.get("type","")).replace(".", "") == ext_target]
         bot.edit_message_text(f"🗂 .{ext_target.upper()} ({len(subset)} files):", cid, mid, reply_markup=_files_markup(subset))
         bot.answer_callback_query(call.id)
         return
@@ -343,19 +365,7 @@ def on_callback(call):
 
     bot.answer_callback_query(call.id)
 
-# ──────────────────────────── GROUP HARVEST ─────────────────────
-
-@bot.message_handler(
-    content_types=["document", "video", "audio"],
-    func=lambda m: m.chat.type in ("group", "supergroup") and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
-)
-def on_group_file(msg):
-    f = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
-    name = getattr(f, "file_name", None) or f"{msg.content_type}_{f.file_id[:8]}"
-    if _add_record(name, f.file_id, msg.content_type):
-        log.info("Harvested: %s", name)
-
-# ──────────────────────────── DM UPLOADS & FORWARDS ─────────────
+# ──────────────────────────── UPLOADS & ROUTING ─────────────────
 
 @bot.message_handler(
     content_types=["document", "video", "audio"],
@@ -366,41 +376,45 @@ def on_dm_file(msg):
     _log_msg(uid, msg.message_id)
     _ping(uid)
 
-    f = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
-    name = getattr(f, "file_name", None) or f"{msg.content_type}_{f.file_id[:8]}"
+    file_obj = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
+    
+    # Smart Naming Engine
+    name = _determine_filename(msg, file_obj, msg.content_type)
 
-    # Database Restore Catch
-    if name.endswith(".json") and "vault" in name.lower():
-        try:
-            info = bot.get_file(f.file_id)
-            raw = bot.download_file(info.file_path)
-            data = json.loads(raw.decode("utf-8"))
-            if isinstance(data, list):
-                _save_db(data)
-                _set_state(uid, "UNLOCKED")
-                _track_send(bot.send_message, uid, f"✅ Restored {len(data)}", reply_markup=_menu_markup())
-                return
-        except Exception:
-            _track_send(bot.send_message, uid, "❌ Restore failed")
-            return
-
-    # Route copy to H Group for permanent storage
+    # Route copy to H Group cleanly
+    routed = False
     if SOURCE_GROUP_ID:
         try:
-            bot.copy_message(SOURCE_GROUP_ID, msg.chat.id, msg.message_id)
+            if msg.content_type == "video": bot.send_video(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            elif msg.content_type == "audio": bot.send_audio(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            else: bot.send_document(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            routed = True
         except Exception as e:
-            log.warning("Failed to route file to H-group: %s", e)
+            log.warning("H-Group routing failed: %s", e)
 
     # Save to database
-    if _add_record(name, f.file_id, msg.content_type):
-        _track_send(bot.send_message, uid, f"✅ Saved: {name}")
+    if _add_record(name, file_obj.file_id, msg.content_type):
+        status = "✅ Saved & Routed" if routed else "✅ Saved (Local Only)"
+        _track_send(bot.send_message, uid, f"{status}:\n{name}")
     else:
-        _track_send(bot.send_message, uid, f"⚠️ Duplicate skipped: {name}")
+        _track_send(bot.send_message, uid, f"⚠️ Duplicate skipped:\n{name}")
 
-    # Return to unlocked menu if they used the upload button
     if _state(uid) == "AWAITING_UPLOAD":
         _set_state(uid, "UNLOCKED")
         _track_send(bot.send_message, uid, "🟢 Open.", reply_markup=_menu_markup())
+
+# ──────────────────────────── GROUP HARVEST ─────────────────────
+
+@bot.message_handler(
+    content_types=["document", "video", "audio"],
+    func=lambda m: m.chat.type in ("group", "supergroup") and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
+)
+def on_group_file(msg):
+    file_obj = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
+    name = _determine_filename(msg, file_obj, msg.content_type)
+    
+    if _add_record(name, file_obj.file_id, msg.content_type):
+        log.info("Harvested: %s", name)
 
 # ──────────────────────────── DM TEXT ───────────────────────────
 
