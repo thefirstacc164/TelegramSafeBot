@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vault Bot — discrete Telegram file_id vault.
-Features: GitHub storage + aggressive chat wipe + native .zip sends (no links) + auto-harvest.
+Features: GitHub storage, chat wipe, auto-categories, and H-group upload routing.
 """
 
 import os
@@ -11,6 +11,7 @@ import base64
 import threading
 import logging
 from pathlib import Path
+from collections import Counter
 
 import requests
 from flask import Flask
@@ -24,7 +25,7 @@ VAULT_PASSWORD  = os.environ.get("VAULT_PASSWORD", "")
 PORT            = int(os.environ.get("PORT", 8080))
 
 GITHUB_TOKEN    = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO     = os.environ.get("GITHUB_REPO", "")          # e.g. "user/vault-db"
+GITHUB_REPO     = os.environ.get("GITHUB_REPO", "")          
 GITHUB_FILE     = os.environ.get("GITHUB_FILE", "games_vault_db.json")
 
 DB_FILE         = "games_vault_db.json"
@@ -55,23 +56,18 @@ bot = telebot.TeleBot(API_TOKEN, parse_mode=None)
 user_states: dict[int, str] = {}
 last_activity: dict[int, float] = {}
 
-# ──────────────────────────── JSON HELPERS ──────────────────────
+# ──────────────────────────── JSON & GITHUB ─────────────────────
 
 def _load_json(path: str, default):
     p = Path(path)
-    if not p.exists():
-        return default
+    if not p.exists(): return default
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(p, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
 
 def _save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-# ──────────────────────────── GITHUB PERSISTENCE ────────────────
 
 def _gh_headers():
     return {
@@ -81,13 +77,11 @@ def _gh_headers():
     }
 
 def _gh_get_sha_and_content():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return None, None
+    if not GITHUB_TOKEN or not GITHUB_REPO: return None, None
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
     try:
         r = requests.get(url, headers=_gh_headers(), timeout=15)
-        if r.status_code == 404:
-            return None, None
+        if r.status_code == 404: return None, None
         r.raise_for_status()
         data = r.json()
         content = base64.b64decode(data["content"]).decode("utf-8")
@@ -97,32 +91,24 @@ def _gh_get_sha_and_content():
         return None, None
 
 def _gh_push(records: list):
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
     sha, _ = _gh_get_sha_and_content()
     payload = {
         "message": f"vault sync {int(time.time())}",
-        "content": base64.b64encode(
-            json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("ascii"),
+        "content": base64.b64encode(json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
     }
-    if sha:
-        payload["sha"] = sha
+    if sha: payload["sha"] = sha
     try:
         r = requests.put(url, headers=_gh_headers(), json=payload, timeout=20)
-        if r.status_code in (200, 201):
-            log.info("GitHub sync OK (%d games)", len(records))
-        else:
-            log.warning("GitHub push %s: %s", r.status_code, r.text[:200])
-    except Exception as e:
-        log.warning("GitHub push failed: %s", e)
+        if r.status_code in (200, 201): log.info("GitHub sync OK (%d files)", len(records))
+    except Exception as e: log.warning("GitHub push failed: %s", e)
 
 def _pull_db_from_github():
     sha, content = _gh_get_sha_and_content()
     if content and isinstance(content, list):
         _save_json(DB_FILE, content)
-        log.info("Restored %d games from GitHub", len(content))
+        log.info("Restored %d files from GitHub", len(content))
         return True
     return False
 
@@ -137,11 +123,16 @@ def _save_db(records: list):
 
 def _add_record(name: str, file_id: str, file_type: str) -> bool:
     records = _load_db()
-    if any(r.get("file_id") == file_id for r in records):
-        return False
+    if any(r.get("file_id") == file_id for r in records): return False
     records.append({"name": name, "file_id": file_id, "type": file_type})
     _save_db(records)
     return True
+
+def _get_ext(name: str) -> str:
+    """Extracts file extension (e.g., '.zip'). Defaults to 'other'."""
+    if "." in name:
+        return "." + name.rsplit(".", 1)[-1].lower()
+    return "other"
 
 # ──────────────────────────── MESSAGE LOG + WIPE ────────────────
 
@@ -151,21 +142,16 @@ def _log_msg(chat_id: int, message_id: int):
     logs.setdefault(cid, [])
     if message_id not in logs[cid]:
         logs[cid].append(message_id)
-        if len(logs[cid]) > 500:
-            logs[cid] = logs[cid][-400:]
+        if len(logs[cid]) > 500: logs[cid] = logs[cid][-400:]
     _save_json(MSG_LOG_FILE, logs)
 
 def _track_send(method, chat_id, *args, **kwargs):
-    if method == bot.send_message:
-        kwargs.setdefault("disable_web_page_preview", True)
+    if method == bot.send_message: kwargs.setdefault("disable_web_page_preview", True)
     try:
         m = method(chat_id, *args, **kwargs)
-        if m and hasattr(m, "message_id"):
-            _log_msg(chat_id, m.message_id)
+        if m and hasattr(m, "message_id"): _log_msg(chat_id, m.message_id)
         return m
-    except Exception as e:
-        log.warning("Send failed: %s", e)
-        return None
+    except Exception as e: return None
 
 def _aggressive_wipe(chat_id: int) -> int:
     deleted = 0
@@ -173,68 +159,70 @@ def _aggressive_wipe(chat_id: int) -> int:
     cid = str(chat_id)
     tracked = list(logs.get(cid, []))
     for mid in tracked:
-        try:
-            bot.delete_message(chat_id, mid)
-            deleted += 1
-        except Exception:
-            pass
+        try: bot.delete_message(chat_id, mid); deleted += 1
+        except Exception: pass
     logs[cid] = []
     _save_json(MSG_LOG_FILE, logs)
 
     try:
         probe = bot.send_message(chat_id, "·")
         max_id = probe.message_id
-        try:
-            bot.delete_message(chat_id, max_id)
-            deleted += 1
-        except Exception:
-            pass
-    except Exception:
-        return deleted
+        try: bot.delete_message(chat_id, max_id); deleted += 1
+        except Exception: pass
+    except Exception: return deleted
 
-    consecutive_fail = 0
+    fails = 0
     for mid in range(max_id - 1, max(max_id - 350, 0), -1):
         try:
-            bot.delete_message(chat_id, mid)
-            deleted += 1
-            consecutive_fail = 0
+            bot.delete_message(chat_id, mid); deleted += 1; fails = 0
             time.sleep(0.03)
         except Exception:
-            consecutive_fail += 1
-            if consecutive_fail >= 20:
-                break
+            fails += 1
+            if fails >= 20: break
     return deleted
 
 # ──────────────────────────── STATE ─────────────────────────────
 
-def _state(uid: int) -> str:
-    return user_states.get(uid, "LOCKED")
-
-def _set_state(uid: int, state: str):
-    user_states[uid] = state
-    last_activity[uid] = time.time()
-
-def _ping(uid: int):
-    last_activity[uid] = time.time()
-
-def _is_private(msg) -> bool:
-    return msg.chat.type == "private"
+def _state(uid: int) -> str: return user_states.get(uid, "LOCKED")
+def _set_state(uid: int, state: str): user_states[uid] = state; last_activity[uid] = time.time()
+def _ping(uid: int): last_activity[uid] = time.time()
+def _is_private(msg) -> bool: return msg.chat.type == "private"
 
 # ──────────────────────────── UI ────────────────────────────────
 
 def _menu_markup():
     mk = InlineKeyboardMarkup(row_width=2)
     mk.add(
-        InlineKeyboardButton("📂 All Games", callback_data="cb_all"),
+        InlineKeyboardButton("📂 All Files", callback_data="cb_all"),
+        InlineKeyboardButton("📁 Categories", callback_data="cb_cats")
+    )
+    mk.add(
         InlineKeyboardButton("🔍 Search", callback_data="cb_search"),
+        InlineKeyboardButton("📤 Upload", callback_data="cb_up")
     )
     mk.add(InlineKeyboardButton("🔒 Lock & Wipe", callback_data="cb_lock"))
     return mk
 
-def _files_markup(records: list):
+def _files_markup(records_with_indices: list):
+    """Expects a list of tuples: (original_idx, record)"""
     mk = InlineKeyboardMarkup(row_width=1)
-    for idx, rec in enumerate(records):
+    for idx, rec in records_with_indices:
         mk.add(InlineKeyboardButton(f"📦 {rec['name']}", callback_data=f"dl_{idx}"))
+    mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
+    return mk
+
+def _categories_markup(records: list):
+    # Count extensions
+    exts = [_get_ext(r.get("name", "")) for r in records]
+    counts = Counter(exts)
+    
+    mk = InlineKeyboardMarkup(row_width=2)
+    # Sort by popularity (most common first)
+    for ext, count in counts.most_common():
+        # Encode extension into callback data safely
+        safe_ext = ext.replace(".", "")
+        mk.add(InlineKeyboardButton(f"🗂 {ext.upper()} ({count})", callback_data=f"cat_{safe_ext}"))
+    
     mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
     return mk
 
@@ -264,17 +252,14 @@ def cmd_delete(msg):
 @bot.message_handler(commands=["backup"], func=lambda m: _is_private(m))
 def cmd_backup(msg):
     uid = msg.from_user.id
-    if _state(uid) != "UNLOCKED":
-        return
+    if _state(uid) != "UNLOCKED": return
     _log_msg(uid, msg.message_id)
     if Path(DB_FILE).exists():
-        with open(DB_FILE, "rb") as f:
-            _track_send(bot.send_document, uid, f, caption="💾")
+        with open(DB_FILE, "rb") as f: _track_send(bot.send_document, uid, f, caption="💾")
 
 @bot.message_handler(commands=["chatid"])
 def cmd_chatid(msg):
-    bot.reply_to(msg, f"`{msg.chat.id}`", parse_mode="Markdown",
-                 disable_web_page_preview=True)
+    bot.reply_to(msg, f"`{msg.chat.id}`", parse_mode="Markdown", disable_web_page_preview=True)
 
 # ──────────────────────────── CALLBACKS ─────────────────────────
 
@@ -295,14 +280,38 @@ def on_callback(call):
         if not records:
             bot.edit_message_text("❌ Not found.", cid, mid, reply_markup=_back_markup())
         else:
-            bot.edit_message_text(f"🎮 Games: {len(records)}", cid, mid,
-                                  reply_markup=_files_markup(records))
+            subset = [(i, r) for i, r in enumerate(records)]
+            bot.edit_message_text(f"📂 Files: {len(records)}", cid, mid, reply_markup=_files_markup(subset))
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "cb_cats":
+        records = _load_db()
+        if not records:
+            bot.edit_message_text("❌ Not found.", cid, mid, reply_markup=_back_markup())
+        else:
+            bot.edit_message_text("📁 Categories:", cid, mid, reply_markup=_categories_markup(records))
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("cat_"):
+        ext_target = data.split("_", 1)[1]
+        records = _load_db()
+        # Find all files where the extension (without dot) matches the target
+        subset = [(i, r) for i, r in enumerate(records) if _get_ext(r.get("name","")).replace(".", "") == ext_target]
+        bot.edit_message_text(f"🗂 .{ext_target.upper()} ({len(subset)} files):", cid, mid, reply_markup=_files_markup(subset))
         bot.answer_callback_query(call.id)
         return
 
     if data == "cb_search":
         _set_state(uid, "AWAITING_SEARCH")
         bot.edit_message_text("🔍 Enter name:", cid, mid, reply_markup=_back_markup())
+        bot.answer_callback_query(call.id)
+        return
+        
+    if data == "cb_up":
+        _set_state(uid, "AWAITING_UPLOAD")
+        bot.edit_message_text("📤 Send file now:", cid, mid, reply_markup=_back_markup())
         bot.answer_callback_query(call.id)
         return
 
@@ -325,10 +334,9 @@ def on_callback(call):
             idx = int(data[3:])
             rec = _load_db()[idx]
             # Native file bubble — caption="" forces Telegram to hide all text/links
-            if rec.get("type") == "video":
-                _track_send(bot.send_video, cid, rec["file_id"], caption="")
-            else:
-                _track_send(bot.send_document, cid, rec["file_id"], caption="")
+            if rec.get("type") == "video": _track_send(bot.send_video, cid, rec["file_id"], caption="")
+            elif rec.get("type") == "audio": _track_send(bot.send_audio, cid, rec["file_id"], caption="")
+            else: _track_send(bot.send_document, cid, rec["file_id"], caption="")
         except Exception:
             _track_send(bot.send_message, cid, "❌")
         return
@@ -338,32 +346,30 @@ def on_callback(call):
 # ──────────────────────────── GROUP HARVEST ─────────────────────
 
 @bot.message_handler(
-    content_types=["document", "video"],
-    func=lambda m: m.chat.type in ("group", "supergroup")
-                   and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
+    content_types=["document", "video", "audio"],
+    func=lambda m: m.chat.type in ("group", "supergroup") and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
 )
 def on_group_file(msg):
-    f = msg.document if msg.content_type == "document" else msg.video
-    ftype = "document" if msg.content_type == "document" else "video"
-    name = getattr(f, "file_name", None) or f"{ftype}_{f.file_id[:8]}"
-    if _add_record(name, f.file_id, ftype):
+    f = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
+    name = getattr(f, "file_name", None) or f"{msg.content_type}_{f.file_id[:8]}"
+    if _add_record(name, f.file_id, msg.content_type):
         log.info("Harvested: %s", name)
 
-# ──────────────────────────── DM FILES / FORWARDS ───────────────
+# ──────────────────────────── DM UPLOADS & FORWARDS ─────────────
 
 @bot.message_handler(
-    content_types=["document", "video"],
-    func=lambda m: _is_private(m) and _state(m.from_user.id) == "UNLOCKED"
+    content_types=["document", "video", "audio"],
+    func=lambda m: _is_private(m) and _state(m.from_user.id) in ("UNLOCKED", "AWAITING_UPLOAD")
 )
 def on_dm_file(msg):
     uid = msg.from_user.id
     _log_msg(uid, msg.message_id)
     _ping(uid)
 
-    f = msg.document if msg.content_type == "document" else msg.video
-    ftype = "document" if msg.content_type == "document" else "video"
-    name = getattr(f, "file_name", None) or f"{ftype}_{f.file_id[:8]}"
+    f = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
+    name = getattr(f, "file_name", None) or f"{msg.content_type}_{f.file_id[:8]}"
 
+    # Database Restore Catch
     if name.endswith(".json") and "vault" in name.lower():
         try:
             info = bot.get_file(f.file_id)
@@ -371,17 +377,30 @@ def on_dm_file(msg):
             data = json.loads(raw.decode("utf-8"))
             if isinstance(data, list):
                 _save_db(data)
-                _track_send(bot.send_message, uid, f"✅ Restored {len(data)}",
-                            reply_markup=_menu_markup())
+                _set_state(uid, "UNLOCKED")
+                _track_send(bot.send_message, uid, f"✅ Restored {len(data)}", reply_markup=_menu_markup())
                 return
-        except Exception as e:
+        except Exception:
             _track_send(bot.send_message, uid, "❌ Restore failed")
             return
 
-    if _add_record(name, f.file_id, ftype):
-        _track_send(bot.send_message, uid, f"✅ {name}")
+    # Route copy to H Group for permanent storage
+    if SOURCE_GROUP_ID:
+        try:
+            bot.copy_message(SOURCE_GROUP_ID, msg.chat.id, msg.message_id)
+        except Exception as e:
+            log.warning("Failed to route file to H-group: %s", e)
+
+    # Save to database
+    if _add_record(name, f.file_id, msg.content_type):
+        _track_send(bot.send_message, uid, f"✅ Saved: {name}")
     else:
         _track_send(bot.send_message, uid, f"⚠️ Duplicate skipped: {name}")
+
+    # Return to unlocked menu if they used the upload button
+    if _state(uid) == "AWAITING_UPLOAD":
+        _set_state(uid, "UNLOCKED")
+        _track_send(bot.send_message, uid, "🟢 Open.", reply_markup=_menu_markup())
 
 # ──────────────────────────── DM TEXT ───────────────────────────
 
@@ -392,10 +411,8 @@ def on_text(msg):
     state = _state(uid)
 
     if state == "LOCKED":
-        try:
-            bot.delete_message(cid, msg.message_id)
-        except Exception:
-            pass
+        try: bot.delete_message(cid, msg.message_id)
+        except Exception: pass
         if msg.text and msg.text.strip() == VAULT_PASSWORD:
             _set_state(uid, "UNLOCKED")
             _track_send(bot.send_message, cid, "🟢 Open.", reply_markup=_menu_markup())
@@ -409,17 +426,12 @@ def on_text(msg):
     if state == "AWAITING_SEARCH":
         query = (msg.text or "").strip().lower()
         records = _load_db()
-        matches = [(i, r) for i, r in enumerate(records)
-                   if query in r.get("name", "").lower()]
+        matches = [(i, r) for i, r in enumerate(records) if query in r.get("name", "").lower()]
         _set_state(uid, "UNLOCKED")
         if not matches:
             _track_send(bot.send_message, cid, "❌ Not found.", reply_markup=_menu_markup())
         else:
-            mk = InlineKeyboardMarkup(row_width=1)
-            for idx, rec in matches:
-                mk.add(InlineKeyboardButton(f"📦 {rec['name']}", callback_data=f"dl_{idx}"))
-            mk.add(InlineKeyboardButton("⬅️ Back", callback_data="cb_back"))
-            _track_send(bot.send_message, cid, f"🎮 {len(matches)}", reply_markup=mk)
+            _track_send(bot.send_message, cid, f"🎮 {len(matches)}", reply_markup=_files_markup(matches))
 
 # ──────────────────────────── 24h AUTO-WIPE ─────────────────────
 
@@ -434,7 +446,7 @@ def _auto_delete_worker():
                     _aggressive_wipe(uid)
                     last_activity.pop(uid, None)
                 else:
-                    last_activity[uid] = ts + 3600  # +1h grace if session open
+                    last_activity[uid] = ts + 3600  
 
 # ──────────────────────────── MAIN ──────────────────────────────
 
@@ -444,17 +456,14 @@ def main():
         raise SystemExit(1)
 
     if not _pull_db_from_github():
-        if not Path(DB_FILE).exists():
-            _save_json(DB_FILE, [])
-    if not Path(MSG_LOG_FILE).exists():
-        _save_json(MSG_LOG_FILE, {})
+        if not Path(DB_FILE).exists(): _save_json(DB_FILE, [])
+    if not Path(MSG_LOG_FILE).exists(): _save_json(MSG_LOG_FILE, {})
 
     threading.Thread(target=_run_flask, daemon=True).start()
     threading.Thread(target=_auto_delete_worker, daemon=True).start()
 
     log.info("Polling… GitHub repo=%s", GITHUB_REPO or "OFF")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60,
-                         allowed_updates=["message", "callback_query"])
+    bot.infinity_polling(timeout=60, long_polling_timeout=60, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
     main()
