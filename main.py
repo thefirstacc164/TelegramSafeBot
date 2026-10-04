@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vault Bot — discrete Telegram file_id vault.
-Features: GitHub storage, Smart Naming (/name), Auto-sequencing, Categories, and H-group routing.
+Features: GitHub storage, Smart Naming (/name), Categories, H-group routing, and Photo support.
 """
 
 import os
@@ -135,6 +135,7 @@ def _get_ext(name: str, ftype: str) -> str:
     if "." in name and len(name.rsplit(".", 1)[-1]) <= 4:
         return "." + name.rsplit(".", 1)[-1].lower()
     if ftype == "video": return ".mp4"
+    if ftype == "photo": return ".jpg"
     if ftype == "audio": return ".mp3"
     if ftype == "document": return ".zip"
     return ".bin"
@@ -152,24 +153,34 @@ def _determine_filename(msg, file_obj, ftype: str) -> str:
             name = cap
             
     # 2. Check original filename
-    if not name:
+    if not name and hasattr(file_obj, "file_name"):
         name = getattr(file_obj, "file_name", None)
         
-    # 3. Auto-Sequencer (e.g., Video_1)
+    # 3. Auto-Sequencer (e.g., Photo_1, Video_1)
     if not name:
         records = _load_db()
         count = sum(1 for r in records if r.get("type") == ftype)
         name = f"{ftype.capitalize()}_{count + 1}"
         
-    # Clean up multiline captions to just the first line
     name = name.split("\n")[0][:60].strip()
     
-    # Ensure it has an extension
     ext = _get_ext(name, ftype)
     if not name.lower().endswith(ext):
         name += ext
         
     return name
+
+def _get_file_obj_and_type(msg):
+    """Extract file object and type string across all message types."""
+    if msg.content_type == "document":
+        return msg.document, "document"
+    elif msg.content_type == "video":
+        return msg.video, "video"
+    elif msg.content_type == "audio":
+        return msg.audio, "audio"
+    elif msg.content_type == "photo":
+        return msg.photo[-1], "photo"  # Highest resolution photo
+    return None, "document"
 
 # ──────────────────────────── MESSAGE LOG + WIPE ────────────────
 
@@ -355,9 +366,11 @@ def on_callback(call):
         try:
             idx = int(data[3:])
             rec = _load_db()[idx]
-            # Native file bubble — caption="" forces Telegram to hide all text/links
-            if rec.get("type") == "video": _track_send(bot.send_video, cid, rec["file_id"], caption="")
-            elif rec.get("type") == "audio": _track_send(bot.send_audio, cid, rec["file_id"], caption="")
+            ftype = rec.get("type")
+            
+            if ftype == "video": _track_send(bot.send_video, cid, rec["file_id"], caption="")
+            elif ftype == "photo": _track_send(bot.send_photo, cid, rec["file_id"], caption="")
+            elif ftype == "audio": _track_send(bot.send_audio, cid, rec["file_id"], caption="")
             else: _track_send(bot.send_document, cid, rec["file_id"], caption="")
         except Exception:
             _track_send(bot.send_message, cid, "❌")
@@ -368,7 +381,7 @@ def on_callback(call):
 # ──────────────────────────── UPLOADS & ROUTING ─────────────────
 
 @bot.message_handler(
-    content_types=["document", "video", "audio"],
+    content_types=["document", "video", "audio", "photo"],
     func=lambda m: _is_private(m) and _state(m.from_user.id) in ("UNLOCKED", "AWAITING_UPLOAD")
 )
 def on_dm_file(msg):
@@ -376,24 +389,23 @@ def on_dm_file(msg):
     _log_msg(uid, msg.message_id)
     _ping(uid)
 
-    file_obj = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
-    
-    # Smart Naming Engine
-    name = _determine_filename(msg, file_obj, msg.content_type)
+    file_obj, ftype = _get_file_obj_and_type(msg)
+    name = _determine_filename(msg, file_obj, ftype)
 
     # Route copy to H Group cleanly
     routed = False
     if SOURCE_GROUP_ID:
         try:
-            if msg.content_type == "video": bot.send_video(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
-            elif msg.content_type == "audio": bot.send_audio(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            if ftype == "video": bot.send_video(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            elif ftype == "photo": bot.send_photo(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
+            elif ftype == "audio": bot.send_audio(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
             else: bot.send_document(SOURCE_GROUP_ID, file_obj.file_id, caption=f"Stored: {name}")
             routed = True
         except Exception as e:
             log.warning("H-Group routing failed: %s", e)
 
     # Save to database
-    if _add_record(name, file_obj.file_id, msg.content_type):
+    if _add_record(name, file_obj.file_id, ftype):
         status = "✅ Saved & Routed" if routed else "✅ Saved (Local Only)"
         _track_send(bot.send_message, uid, f"{status}:\n{name}")
     else:
@@ -406,14 +418,14 @@ def on_dm_file(msg):
 # ──────────────────────────── GROUP HARVEST ─────────────────────
 
 @bot.message_handler(
-    content_types=["document", "video", "audio"],
+    content_types=["document", "video", "audio", "photo"],
     func=lambda m: m.chat.type in ("group", "supergroup") and (not SOURCE_GROUP_ID or str(m.chat.id) == SOURCE_GROUP_ID)
 )
 def on_group_file(msg):
-    file_obj = msg.document if msg.content_type == "document" else msg.video if msg.content_type == "video" else msg.audio
-    name = _determine_filename(msg, file_obj, msg.content_type)
+    file_obj, ftype = _get_file_obj_and_type(msg)
+    name = _determine_filename(msg, file_obj, ftype)
     
-    if _add_record(name, file_obj.file_id, msg.content_type):
+    if _add_record(name, file_obj.file_id, ftype):
         log.info("Harvested: %s", name)
 
 # ──────────────────────────── DM TEXT ───────────────────────────
